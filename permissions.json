@@ -95,6 +95,7 @@
       "WebFetch(domain:wiki.archlinux.org)",
       "WebFetch(domain:ubuntu.com)",
       "WebFetch(domain:code.visualstudio.com)",
+      "WebFetch(domain:stillcuriouscat.github.io)",
       "Bash(gh *)"
     ]
   }
