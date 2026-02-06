@@ -131,20 +131,22 @@ tail -f /tmp/permission-guard.log
 
 ## Customization
 
-### Add trusted domains
+All permission rules live in `~/.claude/settings.json`. The `permissions.json` in this repo is just a reference template.
 
-Edit `~/.claude/settings.json`, add to `permissions.allow`:
-
-```json
-"WebFetch(domain:your-domain.com)"
-```
-
-### Add dangerous commands
-
-Edit `~/.claude/settings.json`, add to `permissions.deny`:
+To customize, edit your `~/.claude/settings.json` directly:
 
 ```json
-"Bash(dangerous-command *)"
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:your-trusted-site.com)",
+      "Bash(your-safe-command *)"
+    ],
+    "deny": [
+      "Bash(your-dangerous-command *)"
+    ]
+  }
+}
 ```
 
 ## License
