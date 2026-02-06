@@ -2,76 +2,95 @@
 
 > AI-powered security guard for Claude Code permission requests
 
-Permission Patrol combines Claude Code's built-in permissions with an Opus agent hook for intelligent security review. **No API key required** - uses your Claude Code subscription.
+Permission Patrol uses a command hook with Opus API to intelligently review permission requests that aren't handled by deterministic rules.
 
 ## How It Works
 
 ```
 Request arrives
     │
-    ├─ In permissions.deny? ──→ Reject immediately (no quota used)
-    │   (rm -rf, curl POST, scp...)
+    ├─ settings.json deny? ──→ Reject immediately (no API call)
+    │   (rm -rf, curl POST, scp, gh repo delete...)
     │
-    ├─ In permissions.allow? ──→ Pass immediately (no quota used)
-    │   (git status, ls, Read, ruff...)
+    ├─ settings.json allow? ──→ Pass immediately (no API call)
+    │   (git status, ls, Read, ruff, gh...)
     │
-    └─ Neither? ──→ Opus agent reviews
+    └─ Neither? ──→ permission-guard.py hook
          │
-         ├─ If running a script ──→ Read script content, check for dangerous code
+         ├─ PHASE 1: Dangerous regex? ──→ Deny
          │
-         └─ Make decision: allow / deny / ask
+         ├─ PHASE 2: Script execution? ──→ Opus reviews script content
+         │   (python xxx.py, pytest, node...)
+         │
+         └─ PHASE 3: Other cases ──→ Ask user
 ```
 
 ## Features
 
 | Operation | Handling |
 |-----------|----------|
-| Delete files (`rm -rf`, `shred`) | ❌ Reject |
-| Upload data (`curl POST`, `scp`) | ❌ Reject |
-| Read-only ops (`ls`, `cat`, `Read`) | ✅ Pass |
-| Linters (`ruff`, `mypy`, `eslint`) | ✅ Pass |
-| Trusted domains (`github.com`, `pypi.org`) | ✅ Pass |
-| git push | ⏸️ Opus reviews → Ask user |
+| Delete files (`rm -rf`, `shred`) | ❌ Deny (settings.json) |
+| Upload data (`curl POST`, `scp`) | ❌ Deny (settings.json) |
+| GitHub delete (`gh repo delete`) | ❌ Deny (settings.json) |
+| Read-only ops (`ls`, `cat`, `Read`) | ✅ Allow (settings.json) |
+| Linters (`ruff`, `mypy`, `eslint`) | ✅ Allow (settings.json) |
+| Trusted domains (`github.com`...) | ✅ Allow (settings.json) |
+| GitHub CLI (`gh *`) | ✅ Allow (settings.json) |
 | Run Python/pytest | 🤖 Opus reads script, checks for dangerous code |
-| Unknown operations | 🤖 Opus decides |
+| Write code with `os.remove` etc. | 🤖 Opus reviews |
+| Unknown operations | 👤 Ask user |
+
+## Requirements
+
+- Claude Code with hooks support
+- Anthropic API key (stored in `~/.claude/anthropic-api-key`)
+- `anthropic` Python SDK (`pip install anthropic`)
 
 ## Installation
 
-### 1. Merge permissions.json into settings.json
-
-Merge the `deny` and `allow` rules from `permissions.json` into your `~/.claude/settings.json`:
+### 1. Set up API key
 
 ```bash
-cat permissions.json
+# Create API key file (chmod 600 for security)
+echo "sk-ant-xxxxx" > ~/.claude/anthropic-api-key
+chmod 600 ~/.claude/anthropic-api-key
 ```
 
-### 2. Merge hooks.json into settings.json
+### 2. Merge permissions into settings.json
 
-Merge the hooks configuration from `hooks.json` into `~/.claude/settings.json`.
-
-### 3. Final settings.json Structure
+Add the `allow` and `deny` rules from `permissions.json` to your `~/.claude/settings.json`:
 
 ```json
 {
   "permissions": {
-    "deny": [
-      "Bash(rm -rf *)",
+    "allow": [
+      "Bash(git *)",
+      "Bash(gh *)",
+      "WebFetch(domain:github.com)",
       ...
     ],
-    "allow": [
-      "Read(*)",
-      "Bash(git status *)",
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(gh repo delete *)",
       ...
     ]
-  },
+  }
+}
+```
+
+### 3. Add hook to settings.json
+
+```json
+{
   "hooks": {
     "PermissionRequest": [
       {
+        "matcher": "*",
         "hooks": [
           {
-            "type": "agent",
-            "model": "opus",
-            ...
+            "type": "command",
+            "command": "python3 /path/to/permission-patrol/permission-guard.py",
+            "timeout": 30000
           }
         ]
       }
@@ -86,48 +105,47 @@ Merge the hooks configuration from `hooks.json` into `~/.claude/settings.json`.
 
 | File | Description |
 |------|-------------|
-| `permissions.json` | Deterministic rules (direct allow/deny, no quota used) |
-| `hooks.json` | Opus agent hook (intelligent review, uses subscription quota) |
+| `permission-guard.py` | Main hook script - calls Opus API for intelligent review |
+| `permissions.json` | Reference allow/deny rules to merge into settings.json |
 
-## Opus Agent Capabilities
+## How Opus Reviews Scripts
 
-When a request reaches the agent, it will:
+When you run `python3 script.py` or `pytest`:
 
-1. **Analyze the request** - Understand what operation is being performed
-2. **Inspect script content** - If running `python xxx.py` or `pytest`, use Read tool to check:
-   - File deletion operations
-   - HTTP upload/data exfiltration
-   - Command injection risks
-   - Credential/key access
-   - Network connections
-3. **Make a decision** - allow / deny / ask
+1. Hook reads the script file content
+2. Sends content + request info to Opus
+3. Opus checks for:
+   - File deletion (`shutil.rmtree`, `os.remove`)
+   - Data upload (`requests.post`, socket connections)
+   - Credential access (`~/.ssh`, `.env`)
+   - Command injection patterns
+4. Returns: `allow` / `deny` / `ask`
+
+## Debug Logging
+
+Logs are written to `/tmp/permission-guard.log`:
+
+```bash
+tail -f /tmp/permission-guard.log
+```
 
 ## Customization
 
-### Add Trusted Domains
+### Add trusted domains
 
-Edit `permissions.json`, add to `allow`:
-
-```json
-"WebFetch(url: https://your-trusted-domain.com/*)"
-```
-
-### Add Dangerous Commands
-
-Edit `permissions.json`, add to `deny`:
+Edit `~/.claude/settings.json`, add to `permissions.allow`:
 
 ```json
-"Bash(your-dangerous-command *)"
+"WebFetch(domain:your-domain.com)"
 ```
 
-### Adjust Agent Behavior
+### Add dangerous commands
 
-Edit the prompt in `hooks.json` to modify review rules.
+Edit `~/.claude/settings.json`, add to `permissions.deny`:
 
-## Requirements
-
-- Claude Code with hooks support
-- Claude Code subscription (Pro/Max)
+```json
+"Bash(dangerous-command *)"
+```
 
 ## License
 

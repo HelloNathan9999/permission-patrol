@@ -17,14 +17,20 @@ import os
 import re
 import sys
 from pathlib import Path
-from urllib.parse import urlparse
+from datetime import datetime
+
+# Debug log file
+DEBUG_LOG = Path("/tmp/permission-guard.log")
+
+def log_debug(msg: str):
+    """Write debug message to log file."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    with open(DEBUG_LOG, "a") as f:
+        f.write(f"[{timestamp}] {msg}\n")
 
 # ============================================================================
 # Configuration
 # ============================================================================
-
-# Whitelist file path (auto-grows over time)
-TRUSTED_DOMAINS_FILE = Path(__file__).parent / "trusted-domains.txt"
 
 # API key file path (chmod 600 for security)
 API_KEY_FILE = Path.home() / ".claude" / "anthropic-api-key"
@@ -92,26 +98,6 @@ CODE_DANGER_PATTERNS = [
 # Utility Functions
 # ============================================================================
 
-def load_trusted_domains() -> set:
-    """Load trusted domain whitelist."""
-    domains = set()
-    if TRUSTED_DOMAINS_FILE.exists():
-        for line in TRUSTED_DOMAINS_FILE.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                domains.add(line.lower())
-    return domains
-
-
-def extract_domain(url: str) -> str:
-    """Extract domain from URL."""
-    try:
-        parsed = urlparse(url)
-        return parsed.netloc.lower()
-    except Exception:
-        return ""
-
-
 def is_path_in_project(path: str, cwd: str, additional_dirs: list) -> bool:
     """Check if path is within project scope."""
     try:
@@ -165,7 +151,7 @@ def has_code_danger_patterns(code: str) -> list:
 # Opus API Review
 # ============================================================================
 
-def call_opus_for_review(request: dict) -> dict:
+def call_opus_for_review(request: dict, script_content: str = "") -> dict:
     """Call Opus 4.5 for intelligent security review."""
     try:
         import anthropic
@@ -177,6 +163,16 @@ def call_opus_for_review(request: dict) -> dict:
     tool_input = request.get("tool_input", {})
     cwd = request.get("cwd", "")
 
+    # Build script content section if provided
+    script_section = ""
+    if script_content:
+        script_section = f"""
+## Script Content
+```python
+{script_content}
+```
+"""
+
     # Build review prompt
     prompt = f"""You are a security reviewer for Claude Code. Analyze the following permission request and determine if it should be auto-approved.
 
@@ -187,7 +183,7 @@ def call_opus_for_review(request: dict) -> dict:
 ```json
 {json.dumps(tool_input, indent=2, ensure_ascii=False)}
 ```
-
+{script_section}
 ## Security Checklist
 1. **Delete operations**: Will it delete files/directories? (including os.remove, shutil.rmtree in code)
 2. **Upload/Send data**: Will it send data externally? (POST requests, scp, rsync to remote, etc.)
@@ -209,16 +205,20 @@ or {{"decision": "deny", "reason": "reason for denial"}}
     try:
         api_key = load_api_key()
         if not api_key:
+            log_debug("ERROR: API key not found")
             return {"decision": "ask", "reason": "API key not found in ~/.claude/anthropic-api-key"}
+
+        log_debug("Calling Opus API...")
         client = anthropic.Anthropic(api_key=api_key)
         response = client.messages.create(
-            model="claude-opus-4-5-20250929",
+            model="claude-opus-4-5-20251101",
             max_tokens=500,
             messages=[{"role": "user", "content": prompt}]
         )
 
         # Extract text content
         text = response.content[0].text.strip()
+        log_debug(f"Opus response: {text[:200]}")
 
         # Try to parse JSON (may be wrapped in markdown)
         if "```" in text:
@@ -228,13 +228,17 @@ or {{"decision": "deny", "reason": "reason for denial"}}
                 text = match.group(1)
 
         result = json.loads(text)
+        log_debug(f"Opus decision: {result}")
         return result
 
     except json.JSONDecodeError:
+        log_debug("ERROR: Could not parse Opus response")
         return {"decision": "ask", "reason": "Could not parse Opus response"}
     except anthropic.APIError as e:
+        log_debug(f"ERROR: Opus API error: {e}")
         return {"decision": "ask", "reason": f"Opus API error: {e}"}
     except Exception as e:
+        log_debug(f"ERROR: Review error: {e}")
         return {"decision": "ask", "reason": f"Review error: {e}"}
 
 
@@ -280,17 +284,23 @@ def ask_user():
 # ============================================================================
 
 def main():
+    log_debug("=" * 50)
+    log_debug("Hook started")
+
     # 1. Read JSON input from stdin
     try:
         request = json.load(sys.stdin)
     except json.JSONDecodeError:
-        # Cannot parse input, let user decide
+        log_debug("ERROR: Cannot parse JSON input")
         ask_user()
         return
 
     tool_name = request.get("tool_name", "")
     tool_input = request.get("tool_input", {})
     cwd = request.get("cwd", "")
+
+    log_debug(f"Tool: {tool_name}")
+    log_debug(f"Input: {json.dumps(tool_input, ensure_ascii=False)[:200]}")
 
     # Read additionalDirectories from settings.json
     additional_dirs = []
@@ -303,115 +313,117 @@ def main():
             pass
 
     # ========================================================================
-    # 2. Quick check: Dangerous commands (directly deny)
+    # PHASE 1: AUTO DENY (fast reject, no API call)
     # ========================================================================
+    # Note: AUTO ALLOW is handled by settings.json rules before hook is called
 
+    # 1.1 Dangerous command regex patterns
     if tool_name == "Bash":
         command = tool_input.get("command", "")
         is_dangerous, reason = is_dangerous_command(command)
         if is_dangerous:
+            log_debug(f"Dangerous command detected: {reason}")
             deny(f"⛔ {reason}")
             return
 
     # ========================================================================
-    # 3. WebFetch: Domain whitelist check
+    # PHASE 2: OPUS REVIEW (AI decision)
     # ========================================================================
 
-    if tool_name == "WebFetch":
-        url = tool_input.get("url", "")
-        domain = extract_domain(url)
-        trusted_domains = load_trusted_domains()
+    # 2.1 Script execution (python/node/bash + file)
+    if tool_name == "Bash":
+        command = tool_input.get("command", "")
+        script_match = re.search(r'\b(python|python3|node|bash|sh)\s+([^\s;|&]+)', command)
+        if script_match:
+            script_path = script_match.group(2)
+            log_debug(f"Detected script execution: {script_path}")
 
-        # Check if domain is in whitelist (including subdomains)
-        if domain in trusted_domains:
-            allow()
+            # Try to read the script content
+            script_content = ""
+            try:
+                script_full_path = os.path.expanduser(script_path)
+                if not os.path.isabs(script_full_path):
+                    script_full_path = os.path.join(cwd, script_full_path)
+                if os.path.exists(script_full_path):
+                    with open(script_full_path, "r") as f:
+                        script_content = f.read()[:5000]  # Limit to 5000 chars
+                    log_debug(f"Read script content: {len(script_content)} chars")
+                else:
+                    log_debug(f"Script file not found: {script_full_path}")
+            except Exception as e:
+                log_debug(f"Could not read script: {e}")
+
+            log_debug("Calling Opus for script review...")
+            result = call_opus_for_review(request, script_content)
+            decision = result.get("decision", "ask")
+            reason = result.get("reason", "")
+
+            log_debug(f"Opus decision: {decision}, reason: {reason}")
+            if decision == "allow":
+                allow()
+            elif decision == "deny":
+                deny(f"⛔ Opus: {reason}")
+            else:
+                log_debug("Opus unsure, asking user")
+                ask_user()
             return
 
-        # Check if parent domain is in whitelist
-        parts = domain.split(".")
-        for i in range(len(parts) - 1):
-            parent_domain = ".".join(parts[i:])
-            if parent_domain in trusted_domains:
-                allow()
-                return
+    # 2.2 Write/Edit with dangerous code patterns
+    if tool_name in ("Write", "Edit"):
+        content = tool_input.get("content", "") or tool_input.get("new_string", "")
+        danger_patterns = has_code_danger_patterns(content)
+        if danger_patterns:
+            log_debug(f"Dangerous code patterns in Write/Edit: {danger_patterns}")
+            log_debug("Calling Opus for code review...")
+            result = call_opus_for_review(request)
+            decision = result.get("decision", "ask")
+            reason = result.get("reason", "")
 
-        # Domain not in whitelist, let user confirm
-        # (If user approves, PostToolUse hook will auto-add domain to whitelist)
+            log_debug(f"Opus decision: {decision}, reason: {reason}")
+            if decision == "allow":
+                allow()
+            elif decision == "deny":
+                deny(f"⛔ Opus: {reason}")
+            else:
+                log_debug("Opus unsure, asking user")
+                ask_user()
+            return
+
+    # ========================================================================
+    # PHASE 3: ASK USER (fallback)
+    # ========================================================================
+
+    # 3.1 WebFetch unknown domain (not in settings.json allow list)
+    if tool_name == "WebFetch":
+        log_debug(f"Unknown domain, asking user")
         ask_user()
         return
 
-    # ========================================================================
-    # 4. Path check: Is it within project scope?
-    # ========================================================================
-
-    # Extract paths from tool_input
+    # 3.2 Sensitive paths
     paths_to_check = []
     if "file_path" in tool_input:
         paths_to_check.append(tool_input["file_path"])
     if "path" in tool_input:
         paths_to_check.append(tool_input["path"])
 
-    # Bash commands may contain paths
     if tool_name == "Bash":
         command = tool_input.get("command", "")
-        # Simple path extraction (strings starting with / or ~)
         path_matches = re.findall(r'(?:^|\s)([~/][^\s;|&<>]+)', command)
         paths_to_check.extend(path_matches)
 
     for path in paths_to_check:
-        # Check sensitive paths
         if is_sensitive_path(path):
-            ask_user()  # Let user confirm
+            log_debug(f"Sensitive path: {path}, asking user")
+            ask_user()
             return
 
-        # Check if within project scope
         if not is_path_in_project(path, cwd, additional_dirs):
-            ask_user()  # Let user confirm
+            log_debug(f"Path outside project: {path}, asking user")
+            ask_user()
             return
 
-    # ========================================================================
-    # 5. Call Opus for intelligent review
-    # ========================================================================
-
-    # For code execution, first check for dangerous patterns in code
-    if tool_name == "Bash":
-        command = tool_input.get("command", "")
-        # If running Python/Node scripts, need deeper inspection
-        if re.search(r'\b(python|python3|node|bash|sh)\s+', command):
-            result = call_opus_for_review(request)
-            decision = result.get("decision", "ask")
-            reason = result.get("reason", "")
-
-            if decision == "allow":
-                allow()
-            elif decision == "deny":
-                deny(f"⛔ Opus review denied: {reason}")
-            else:
-                ask_user()
-            return
-
-    # For Write/Edit operations, check if content contains dangerous code
-    if tool_name in ("Write", "Edit"):
-        content = tool_input.get("content", "") or tool_input.get("new_string", "")
-        danger_patterns = has_code_danger_patterns(content)
-        if danger_patterns:
-            result = call_opus_for_review(request)
-            decision = result.get("decision", "ask")
-            reason = result.get("reason", "")
-
-            if decision == "allow":
-                allow()
-            elif decision == "deny":
-                deny(f"⛔ Opus review denied: {reason}")
-            else:
-                ask_user()
-            return
-
-    # ========================================================================
-    # 6. Default: Let user decide
-    # ========================================================================
-
-    # For cases not explicitly handled, let user decide
+    # 3.3 Default: anything else goes to user
+    log_debug("No rule matched, asking user")
     ask_user()
 
 

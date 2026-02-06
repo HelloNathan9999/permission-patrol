@@ -1,6 +1,7 @@
 {
   "permissions": {
     "deny": [
+      "Bash(gh repo delete *)",
       "Bash(rm -rf *)",
       "Bash(rm -r /*)",
       "Bash(rm -r ~/*)",
@@ -93,7 +94,8 @@
       "WebFetch(domain:archlinux.org)",
       "WebFetch(domain:wiki.archlinux.org)",
       "WebFetch(domain:ubuntu.com)",
-      "WebFetch(domain:code.visualstudio.com)"
+      "WebFetch(domain:code.visualstudio.com)",
+      "Bash(gh *)"
     ]
   }
 }
