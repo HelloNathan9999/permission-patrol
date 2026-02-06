@@ -61,10 +61,14 @@ DANGEROUS_PATTERNS = [
     r"\bdd\s+.*of=/dev/",
     r"\bchmod\s+777\s+/",
     r"\bchown\s+.*\s+/",
-    # Reverse shell
+    # Reverse shell / data exfiltration
     r"\bnc\s+.*-e\s+",
     r"\bbash\s+-i\s+",
     r"/dev/tcp/",
+    r"\|\s*nc\s+\S+\s+\d+",  # pipe to nc (data exfiltration)
+    r"\|\s*curl\s+",         # pipe to curl
+    r"\|\s*wget\s+",         # pipe to wget
+    r"base64.*\|\s*nc\s+",   # base64 encode then send
 ]
 
 # Dangerous patterns in code (reference for Claude review)
@@ -184,6 +188,7 @@ or {{"decision": "ask", "reason": "reason for confirmation"}}
 or {{"decision": "deny", "reason": "reason for denial"}}
 """
 
+    text = ""  # Initialize for error handling
     try:
         log_debug("Calling Claude CLI (haiku)...")
 
