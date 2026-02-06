@@ -350,6 +350,17 @@ def main():
             pass
 
     # ========================================================================
+    # PHASE 0: USER-INTERACTIVE TOOLS (skip all review, pass to user)
+    # ========================================================================
+    # These tools require direct user interaction (e.g. choosing options).
+    # Auto-allowing them would bypass user input, so always pass through.
+    USER_INTERACTIVE_TOOLS = ["AskUserQuestion"]
+    if tool_name in USER_INTERACTIVE_TOOLS:
+        log_debug(f"User-interactive tool {tool_name}, passing to user directly")
+        ask_user()
+        return
+
+    # ========================================================================
     # PHASE 1: AUTO DENY (fast reject, no API call)
     # ========================================================================
     # Note: AUTO ALLOW is handled by settings.json rules before hook is called
