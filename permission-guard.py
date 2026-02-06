@@ -268,10 +268,58 @@ def deny(reason: str):
     sys.exit(0)
 
 
-def ask_user():
-    """Let user decide (don't return decision)."""
+def ask_user(context: str = ""):
+    """Let user decide (don't return decision).
+
+    Args:
+        context: Optional context message explaining why user confirmation is needed.
+                 Will be shown via stderr and desktop notification.
+    """
+    if context:
+        # Print to stderr so it appears in CLI before the permission dialog
+        print(f"\n{'─' * 50}", file=sys.stderr)
+        print(f"🛡️ Permission Patrol:", file=sys.stderr)
+        print(context, file=sys.stderr)
+        print(f"{'─' * 50}\n", file=sys.stderr)
+        sys.stderr.flush()
+
+        # Also send desktop notification
+        try:
+            subprocess.run(
+                ["notify-send", "-u", "normal", "-t", "10000",
+                 "Permission Patrol", context],
+                capture_output=True,
+                timeout=2
+            )
+        except Exception:
+            pass  # Notification is optional
+
+        log_debug(f"Asking user: {context}")
+
     # exit 0 without outputting decision, Claude Code will show standard permission dialog
     sys.exit(0)
+
+
+def handle_claude_decision(decision: str, reason: str, path: str, cwd: str, additional_dirs: list):
+    """Handle Claude's decision with path-aware logic.
+
+    - deny → deny with warning
+    - allow + inside project → allow
+    - allow + outside project → ask user (double confirmation)
+    - ask → ask user
+    """
+    if decision == "deny":
+        deny(f"⛔ Claude: {reason}")
+    elif decision == "allow":
+        # Check if path is outside project
+        if path and not is_path_in_project(path, cwd, additional_dirs):
+            log_debug(f"Claude approved but path outside project: {path}, asking user")
+            ask_user(f"✅ Claude approved, but path outside project:\n{path}\n\nPlease confirm.")
+        else:
+            allow()
+    else:
+        log_debug("Claude unsure, asking user")
+        ask_user(f"🤔 Claude uncertain: {reason}" if reason else "🤔 Claude needs your decision")
 
 
 # ============================================================================
@@ -287,7 +335,7 @@ def main():
         request = json.load(sys.stdin)
     except json.JSONDecodeError:
         log_debug("ERROR: Cannot parse JSON input")
-        ask_user()
+        ask_user("⚠️ Hook error: cannot parse input")
         return
 
     tool_name = request.get("tool_name", "")
@@ -335,8 +383,8 @@ def main():
 
             # Try to read the script content
             script_content = ""
+            script_full_path = os.path.expanduser(script_path)
             try:
-                script_full_path = os.path.expanduser(script_path)
                 if not os.path.isabs(script_full_path):
                     script_full_path = os.path.join(cwd, script_full_path)
                 if os.path.exists(script_full_path):
@@ -354,18 +402,13 @@ def main():
             reason = result.get("reason", "")
 
             log_debug(f"Claude decision: {decision}, reason: {reason}")
-            if decision == "allow":
-                allow()
-            elif decision == "deny":
-                deny(f"⛔ Claude: {reason}")
-            else:
-                log_debug("Claude unsure, asking user")
-                ask_user()
+            handle_claude_decision(decision, reason, script_full_path, cwd, additional_dirs)
             return
 
     # 2.2 Write/Edit with dangerous code patterns
     if tool_name in ("Write", "Edit"):
         content = tool_input.get("content", "") or tool_input.get("new_string", "")
+        file_path = tool_input.get("file_path", "")
         danger_patterns = has_code_danger_patterns(content)
         if danger_patterns:
             log_debug(f"Dangerous code patterns in Write/Edit: {danger_patterns}")
@@ -375,26 +418,15 @@ def main():
             reason = result.get("reason", "")
 
             log_debug(f"Claude decision: {decision}, reason: {reason}")
-            if decision == "allow":
-                allow()
-            elif decision == "deny":
-                deny(f"⛔ Claude: {reason}")
-            else:
-                log_debug("Claude unsure, asking user")
-                ask_user()
+            handle_claude_decision(decision, reason, file_path, cwd, additional_dirs)
             return
 
     # ========================================================================
-    # PHASE 3: ASK USER (fallback)
+    # PHASE 3: CLAUDE REVIEW FOR OTHER CASES
     # ========================================================================
+    # Instead of directly asking user, let Claude review first
 
-    # 3.1 WebFetch unknown domain (not in settings.json allow list)
-    if tool_name == "WebFetch":
-        log_debug(f"Unknown domain, asking user")
-        ask_user()
-        return
-
-    # 3.2 Sensitive paths
+    # 3.1 Collect paths to check
     paths_to_check = []
     if "file_path" in tool_input:
         paths_to_check.append(tool_input["file_path"])
@@ -406,20 +438,85 @@ def main():
         path_matches = re.findall(r'(?:^|\s)([~/][^\s;|&<>]+)', command)
         paths_to_check.extend(path_matches)
 
+    # 3.2 Check for sensitive paths - always ask user (even if Claude approves)
     for path in paths_to_check:
         if is_sensitive_path(path):
-            log_debug(f"Sensitive path: {path}, asking user")
-            ask_user()
+            log_debug(f"Sensitive path: {path}, calling Claude then asking user")
+            result = call_claude_for_review(request)
+            decision = result.get("decision", "ask")
+            reason = result.get("reason", "")
+
+            if decision == "deny":
+                deny(f"⛔ Claude: {reason}")
+            else:
+                # Even if Claude allows, sensitive paths need user confirmation
+                log_debug("Sensitive path requires user confirmation")
+                ask_user(f"✅ Claude approved, but sensitive path:\n{path}\n\nPlease confirm.")
             return
 
+    # 3.3 Check if any path is outside project
+    has_outside_path = False
+    outside_path = ""
+    for path in paths_to_check:
         if not is_path_in_project(path, cwd, additional_dirs):
-            log_debug(f"Path outside project: {path}, asking user")
-            ask_user()
+            has_outside_path = True
+            outside_path = path
+            break
+
+    # 3.4 For complex Bash commands or unknown operations, let Claude review
+    if tool_name == "Bash":
+        command = tool_input.get("command", "")
+        # Complex command detection: multiple operations, pipes, redirects
+        is_complex = (
+            "&&" in command or
+            "||" in command or
+            "|" in command or
+            ";" in command or
+            len(command) > 100
+        )
+        if is_complex or has_outside_path:
+            log_debug(f"Complex Bash or outside path, calling Claude for review...")
+            result = call_claude_for_review(request)
+            decision = result.get("decision", "ask")
+            reason = result.get("reason", "")
+
+            log_debug(f"Claude decision: {decision}, reason: {reason}")
+            handle_claude_decision(decision, reason, outside_path if has_outside_path else "", cwd, additional_dirs)
             return
 
-    # 3.3 Default: anything else goes to user
-    log_debug("No rule matched, asking user")
-    ask_user()
+    # 3.5 WebFetch unknown domain - let Claude review
+    if tool_name == "WebFetch":
+        log_debug("Unknown domain, calling Claude for review...")
+        result = call_claude_for_review(request)
+        decision = result.get("decision", "ask")
+        reason = result.get("reason", "")
+
+        log_debug(f"Claude decision: {decision}, reason: {reason}")
+        # WebFetch to unknown domains: if Claude allows, still ask user
+        if decision == "deny":
+            deny(f"⛔ Claude: {reason}")
+        else:
+            url = tool_input.get("url", "unknown")
+            ask_user(f"✅ Claude approved, but unknown domain:\n{url}\n\nPlease confirm.")
+        return
+
+    # 3.6 Path outside project - let Claude review first
+    if has_outside_path:
+        log_debug(f"Path outside project: {outside_path}, calling Claude for review...")
+        result = call_claude_for_review(request)
+        decision = result.get("decision", "ask")
+        reason = result.get("reason", "")
+
+        log_debug(f"Claude decision: {decision}, reason: {reason}")
+        if decision == "deny":
+            deny(f"⛔ Claude: {reason}")
+        else:
+            ask_user(f"✅ Claude approved, but path outside project:\n{outside_path}\n\nPlease confirm.")
+        return
+
+    # 3.7 Default: simple operations in project - allow
+    log_debug("Simple operation in project scope, allowing")
+    allow()
 
 
 if __name__ == "__main__":
