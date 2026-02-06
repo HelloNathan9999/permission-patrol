@@ -273,26 +273,20 @@ def ask_user(context: str = ""):
 
     Args:
         context: Optional context message explaining why user confirmation is needed.
-                 Will be shown via stderr and desktop notification.
+                 Will be shown via desktop notification on Linux.
     """
     if context:
-        # Print to stderr so it appears in CLI before the permission dialog
-        print(f"\n{'─' * 50}", file=sys.stderr)
-        print(f"🛡️ Permission Patrol:", file=sys.stderr)
-        print(context, file=sys.stderr)
-        print(f"{'─' * 50}\n", file=sys.stderr)
-        sys.stderr.flush()
-
-        # Also send desktop notification
-        try:
-            subprocess.run(
-                ["notify-send", "-u", "normal", "-t", "10000",
-                 "Permission Patrol", context],
-                capture_output=True,
-                timeout=2
-            )
-        except Exception:
-            pass  # Notification is optional
+        # Send desktop notification on Linux only
+        if sys.platform.startswith("linux"):
+            try:
+                subprocess.run(
+                    ["notify-send", "-u", "normal", "-t", "10000",
+                     "Permission Patrol", context],
+                    capture_output=True,
+                    timeout=2
+                )
+            except Exception:
+                pass  # Notification is optional
 
         log_debug(f"Asking user: {context}")
 
